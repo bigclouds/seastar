@@ -24,23 +24,25 @@
 #include <boost/intrusive_ptr.hpp>
 #include <boost/lexical_cast.hpp>
 #include <boost/optional.hpp>
+#include <iostream>
 #include <iomanip>
 #include <sstream>
-#include "core/app-template.hh"
-#include "core/future-util.hh"
-#include "core/timer-set.hh"
-#include "core/shared_ptr.hh"
-#include "core/stream.hh"
-#include "core/memory.hh"
-#include "core/units.hh"
-#include "core/distributed.hh"
-#include "core/vector-data-sink.hh"
-#include "core/bitops.hh"
-#include "core/slab.hh"
-#include "core/align.hh"
-#include "net/api.hh"
-#include "net/packet-data-source.hh"
-#include "apps/memcached/ascii.hh"
+#include <seastar/core/app-template.hh>
+#include <seastar/core/future-util.hh>
+#include <seastar/core/timer-set.hh>
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/stream.hh>
+#include <seastar/core/memory.hh>
+#include <seastar/core/units.hh>
+#include <seastar/core/distributed.hh>
+#include <seastar/core/vector-data-sink.hh>
+#include <seastar/core/bitops.hh>
+#include <seastar/core/slab.hh>
+#include <seastar/core/align.hh>
+#include <seastar/core/print.hh>
+#include <seastar/net/api.hh>
+#include <seastar/net/packet-data-source.hh>
+#include "ascii.hh"
 #include "memcached.hh"
 #include <unistd.h>
 
@@ -59,6 +61,7 @@ static constexpr double default_slab_growth_factor = 1.25;
 static constexpr uint64_t default_slab_page_size = 1UL*MB;
 static constexpr uint64_t default_per_cpu_slab_size = 0UL; // zero means reclaimer is enabled.
 static __thread slab_allocator<item>* slab;
+static thread_local std::unique_ptr<slab_allocator<item>> slab_holder;
 
 template<typename T>
 using optional = boost::optional<T>;
@@ -178,19 +181,19 @@ public:
         return _version;
     }
 
-    const std::experimental::string_view key() const {
-        return std::experimental::string_view(_data, _key_size);
+    const compat::string_view key() const {
+        return compat::string_view(_data, _key_size);
     }
 
-    const std::experimental::string_view ascii_prefix() const {
+    const compat::string_view ascii_prefix() const {
         const char *p = _data + align_up(_key_size, field_alignment);
-        return std::experimental::string_view(p, _ascii_prefix_size);
+        return compat::string_view(p, _ascii_prefix_size);
     }
 
-    const std::experimental::string_view value() const {
+    const compat::string_view value() const {
         const char *p = _data + align_up(_key_size, field_alignment) +
             align_up(_ascii_prefix_size, field_alignment);
-        return std::experimental::string_view(p, _value_size);
+        return compat::string_view(p, _value_size);
     }
 
     size_t key_size() const {
@@ -266,7 +269,7 @@ public:
         assert(it->_ref_count >= 0);
     }
 
-    friend class item_key_cmp;
+    friend struct item_key_cmp;
 };
 
 struct item_key_cmp
@@ -370,7 +373,7 @@ private:
     static constexpr size_t initial_bucket_count = 1 << 10;
     static constexpr float load_factor = 0.75f;
     size_t _resize_up_threshold = load_factor * initial_bucket_count;
-    cache_type::bucket_type* _buckets;
+    std::vector<cache_type::bucket_type> _buckets;
     cache_type _cache;
     seastar::timer_set<item, &item::_timer_link> _alive;
     timer<clock_type> _timer;
@@ -490,22 +493,21 @@ private:
     void maybe_rehash() {
         if (_cache.size() >= _resize_up_threshold) {
             auto new_size = _cache.bucket_count() * 2;
-            auto old_buckets = _buckets;
+            std::vector<cache_type::bucket_type> old_buckets;
             try {
-                _buckets = new cache_type::bucket_type[new_size];
+                old_buckets = std::exchange(_buckets, std::vector<cache_type::bucket_type>(new_size));
             } catch (const std::bad_alloc& e) {
                 _stats._resize_failure++;
                 return;
             }
-            _cache.rehash(typename cache_type::bucket_traits(_buckets, new_size));
-            delete[] old_buckets;
+            _cache.rehash(typename cache_type::bucket_traits(_buckets.data(), new_size));
             _resize_up_threshold = _cache.bucket_count() * load_factor;
         }
     }
 public:
     cache(uint64_t per_cpu_slab_size, uint64_t slab_page_size)
-        : _buckets(new cache_type::bucket_type[initial_bucket_count])
-        , _cache(cache_type::bucket_traits(_buckets, initial_bucket_count))
+        : _buckets(initial_bucket_count)
+        , _cache(cache_type::bucket_traits(_buckets.data(), initial_bucket_count))
     {
         using namespace std::chrono;
 
@@ -516,8 +518,9 @@ public:
         _flush_timer.set_callback([this] { flush_all(); });
 
         // initialize per-thread slab allocator.
-        slab = new slab_allocator<item>(default_slab_growth_factor, per_cpu_slab_size, slab_page_size,
+        slab_holder = std::make_unique<slab_allocator<item>>(default_slab_growth_factor, per_cpu_slab_size, slab_page_size,
                 [this](item& item_ref) { erase<true, true, false>(item_ref); _stats._evicted++; });
+        slab = slab_holder.get();
 #ifdef __DEBUG__
         static bool print_slab_classes = true;
         if (print_slab_classes) {
@@ -703,7 +706,7 @@ public:
 
         ss << "size: " << _cache.size() << "\n";
         ss << "buckets: " << _cache.bucket_count() << "\n";
-        ss << "load: " << sprint("%.2lf", (double)_cache.size() / _cache.bucket_count()) << "\n";
+        ss << "load: " << format("{:.2f}", (double)_cache.size() / _cache.bucket_count()) << "\n";
         ss << "max bucket occupancy: " << max_size << "\n";
         ss << "bucket occupancy histogram:\n";
 
@@ -1217,6 +1220,7 @@ class udp_server {
 public:
     static const size_t default_max_datagram_size = 1400;
 private:
+    std::optional<future<>> _task;
     sharded_cache& _cache;
     distributed<system_stats>& _system_stats;
     udp_channel _chan;
@@ -1278,7 +1282,8 @@ public:
 
     void start() {
         _chan = engine().net().make_udp_channel({_port});
-        keep_doing([this] {
+        // Run in the background.
+        _task = keep_doing([this] {
             return _chan.receive().then([this](udp_datagram dgram) {
                 packet& p = dgram.get_data();
                 if (p.len() < sizeof(header)) {
@@ -1308,15 +1313,22 @@ public:
                     });
                 });
             });
-        }).or_terminate();
+        });
     };
 
-    future<> stop() { return make_ready_future<>(); }
+    future<> stop() {
+        _chan.shutdown_input();
+        _chan.shutdown_output();
+        return _task->handle_exception([](std::exception_ptr e) {
+            std::cerr << "exception in udp_server " << e << '\n';
+        });
+    }
 };
 
 class tcp_server {
 private:
-    lw_shared_ptr<server_socket> _listener;
+    std::optional<future<>> _task;
+    lw_shared_ptr<seastar::api_v2::server_socket> _listener;
     sharded_cache& _cache;
     distributed<system_stats>& _system_stats;
     uint16_t _port;
@@ -1352,11 +1364,14 @@ public:
     void start() {
         listen_options lo;
         lo.reuse_address = true;
-        _listener = engine().listen(make_ipv4_address({_port}), lo);
-        keep_doing([this] {
-            return _listener->accept().then([this] (connected_socket fd, socket_address addr) mutable {
+        _listener = seastar::api_v2::server_socket(engine().listen(make_ipv4_address({_port}), lo));
+        // Run in the background until eof has reached on the input connection.
+        _task = keep_doing([this] {
+            return _listener->accept().then([this] (accept_result ar) mutable {
+                connected_socket fd = std::move(ar.connection);
+                socket_address addr = std::move(ar.remote_address);
                 auto conn = make_lw_shared<connection>(std::move(fd), addr, _cache, _system_stats);
-                do_until([conn] { return conn->_in.eof(); }, [conn] {
+                (void)do_until([conn] { return conn->_in.eof(); }, [conn] {
                     return conn->_proto.handle(conn->_in, conn->_out).then([conn] {
                         return conn->_out.flush();
                     });
@@ -1364,10 +1379,15 @@ public:
                     return conn->_out.close().finally([conn]{});
                 });
             });
-        }).or_terminate();
+        });
     }
 
-    future<> stop() { return make_ready_future<>(); }
+    future<> stop() {
+        _listener->abort_accept();
+        return _task->handle_exception([](std::exception_ptr e) {
+            std::cerr << "exception in tcp_server " << e << '\n';
+        });
+    }
 };
 
 class stats_printer {
@@ -1380,7 +1400,7 @@ public:
 
     void start() {
         _timer.set_callback([this] {
-            _cache.stats().then([] (auto stats) {
+            (void)_cache.stats().then([] (auto stats) {
                 auto gets_total = stats._get_hits + stats._get_misses;
                 auto get_hit_rate = gets_total ? ((double)stats._get_hits * 100 / gets_total) : 0;
                 auto sets_total = stats._set_adds + stats._set_replaces;
